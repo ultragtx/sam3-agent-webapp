@@ -1,7 +1,7 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Upload, Settings, Play, Loader2, CheckCircle, XCircle } from 'lucide-react';
-import { uploadImage, runAgent, healthCheck, loadModels, getConfig } from './services/api';
-import type { MLLMConfig, AgentResult } from './types';
+import { uploadImage, runAgentStream, healthCheck, loadModels, getConfig } from './services/api';
+import type { MLLMConfig, AgentResult, StreamEvent, AgentRound, SAM3Call } from './types';
 import ImageUpload from './components/ImageUpload';
 import ConfigPanel from './components/ConfigPanel';
 import AgentViewer from './components/AgentViewer';
@@ -16,6 +16,10 @@ function App() {
   const [error, setError] = useState<string>('');
   const [backendStatus, setBackendStatus] = useState<string>('checking');
   const [sam3Loaded, setSam3Loaded] = useState(false);
+  
+  // Real-time streaming state
+  const [currentRounds, setCurrentRounds] = useState<AgentRound[]>([]);
+  const eventSourceRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
     checkBackend();
@@ -76,15 +80,133 @@ function App() {
     setIsRunning(true);
     setError('');
     setAgentResult(null);
+    setCurrentRounds([]);
 
     try {
-      const result = await runAgent(imagePath, textPrompt, mllmConfig, true);
-      setAgentResult(result);
+      // Close any existing event source
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+      }
+
+      eventSourceRef.current = runAgentStream(
+        imagePath,
+        textPrompt,
+        mllmConfig,
+        true,
+        (event: StreamEvent) => {
+          handleStreamEvent(event);
+        },
+        (result: AgentResult) => {
+          setAgentResult(result);
+          setIsRunning(false);
+        },
+        (error: string) => {
+          setError(error);
+          setIsRunning(false);
+        }
+      );
     } catch (err: any) {
       setError(err.response?.data?.message || 'Agent execution failed');
       console.error(err);
-    } finally {
       setIsRunning(false);
+    }
+  };
+
+  const handleStreamEvent = (event: StreamEvent) => {
+    console.log('Stream event:', event);
+    
+    switch (event.type) {
+      case 'round_start':
+        // Initialize new round
+        setCurrentRounds(prev => [
+          ...prev,
+          {
+            round: event.data.round,
+            messages: [],
+            generated_text: '',
+            llm_chunks: [],
+            sam3_calls: [],
+            status: 'pending'
+          }
+        ]);
+        break;
+        
+      case 'llm_start':
+        // Mark LLM as running for current round
+        setCurrentRounds(prev => prev.map(r => 
+          r.round === event.data.round 
+            ? { ...r, status: 'llm_running' }
+            : r
+        ));
+        break;
+        
+      case 'llm_chunk':
+        // Append LLM chunk
+        setCurrentRounds(prev => prev.map(r => 
+          r.round === event.data.round 
+            ? { 
+                ...r, 
+                llm_chunks: [...(r.llm_chunks || []), event.data.chunk],
+                generated_text: event.data.accumulated
+              }
+            : r
+        ));
+        break;
+        
+      case 'llm_complete':
+        // Mark LLM as complete
+        setCurrentRounds(prev => prev.map(r => 
+          r.round === event.data.round 
+            ? { ...r, generated_text: event.data.text, status: 'sam3_running' }
+            : r
+        ));
+        break;
+        
+      case 'sam3_start':
+        // Add SAM3 call
+        setCurrentRounds(prev => prev.map(r => {
+          if (r.status === 'sam3_running') {
+            return {
+              ...r,
+              sam3_calls: [
+                ...(r.sam3_calls || []),
+                {
+                  text_prompt: event.data.text_prompt,
+                  num_masks: 0,
+                  status: 'running'
+                }
+              ]
+            };
+          }
+          return r;
+        }));
+        break;
+        
+      case 'sam3_complete':
+        // Update SAM3 call with results
+        setCurrentRounds(prev => prev.map(r => {
+          if (r.status === 'sam3_running') {
+            const sam3Calls = r.sam3_calls || [];
+            const lastIndex = sam3Calls.length - 1;
+            const updatedCalls = [...sam3Calls];
+            if (lastIndex >= 0) {
+              updatedCalls[lastIndex] = {
+                ...updatedCalls[lastIndex],
+                num_masks: event.data.num_masks,
+                json_path: event.data.json_path,
+                image_path: event.data.image_path,
+                status: 'complete'
+              };
+            }
+            return {
+              ...r,
+              sam3_calls: updatedCalls,
+              status: 'complete'
+            };
+          }
+          return r;
+        }));
+        break;
     }
   };
 
@@ -185,8 +307,12 @@ function App() {
           <div className="lg:col-span-2">
             <div className="bg-gray-800 rounded-lg p-6 shadow-xl min-h-[600px]">
               <h2 className="text-xl font-semibold mb-4">Agent Execution</h2>
-              {agentResult ? (
-                <AgentViewer result={agentResult} />
+              {(agentResult || currentRounds.length > 0) ? (
+                <AgentViewer 
+                  result={agentResult} 
+                  liveRounds={currentRounds}
+                  isRunning={isRunning}
+                />
               ) : (
                 <div className="flex items-center justify-center h-[500px] text-gray-500">
                   <div className="text-center">

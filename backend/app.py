@@ -3,8 +3,10 @@ Flask backend application for SAM3 Agent
 """
 import os
 import json
+import queue
+import threading
 from pathlib import Path
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
@@ -113,7 +115,7 @@ def sam3_segment():
         return jsonify({'error': 'SAM3 model not loaded'}), 503
     
     # Create SAM3 client
-    sam3_client = SAM3Client(sam3_manager.processor)
+    sam3_client = SAM3Client(sam3_manager.processor, output_base_dir=app.config['OUTPUT_FOLDER'])
     
     # Run segmentation
     output_dir = app.config['OUTPUT_FOLDER']
@@ -156,7 +158,7 @@ def run_agent():
     )
     
     # Create SAM3 client
-    sam3_client = SAM3Client(sam3_manager.processor)
+    sam3_client = SAM3Client(sam3_manager.processor, output_base_dir=app.config['OUTPUT_FOLDER'])
     
     # Initialize agent if not exists
     if agent_core is None:
@@ -181,6 +183,98 @@ def run_agent():
         'status': 'success',
         'result': result
     })
+
+
+@app.route('/api/agent/run-stream', methods=['POST'])
+def run_agent_stream():
+    """Run SAM3 Agent with streaming progress updates"""
+    if not request.is_json:
+        return jsonify({'error': 'Content-Type must be application/json'}), 400
+    
+    data = request.json
+    image_path = data.get('image_path')
+    text_prompt = data.get('text_prompt')
+    mllm_config = data.get('mllm_config', {})
+    debug = data.get('debug', True)
+    
+    if not image_path or not text_prompt:
+        return jsonify({'error': 'Missing image_path or text_prompt'}), 400
+    
+    # Validate SAM3 is loaded
+    if sam3_manager is None or not sam3_manager.is_loaded():
+        return jsonify({'error': 'SAM3 model not loaded'}), 500
+    
+    # Create MLLM client
+    mllm_client = MLLMClient(
+        api_base=mllm_config.get('api_base', os.getenv('MLLM_API_BASE')),
+        api_key=mllm_config.get('api_key', os.getenv('MLLM_API_KEY')),
+        model=mllm_config.get('model', os.getenv('MLLM_MODEL_NAME')),
+        max_tokens=mllm_config.get('max_tokens', int(os.getenv('MLLM_MAX_TOKENS', 4096)))
+    )
+    
+    # Create SAM3 client
+    sam3_client = SAM3Client(sam3_manager.processor, output_base_dir=app.config['OUTPUT_FOLDER'])
+    
+    # Initialize agent
+    global agent_core
+    if agent_core is None:
+        agent_core = AgentCore(
+            mllm_client=mllm_client,
+            sam3_client=sam3_client,
+            output_dir=app.config['OUTPUT_FOLDER']
+        )
+    else:
+        agent_core.mllm_client = mllm_client
+        agent_core.sam3_client = sam3_client
+    
+    # Event queue for streaming
+    event_queue = queue.Queue()
+    result_container = {'result': None, 'error': None}
+    
+    def run_agent_thread():
+        """Run agent in background thread"""
+        try:
+            def event_callback(event):
+                event_queue.put(event)
+            
+            result = agent_core.run(
+                image_path=image_path,
+                text_prompt=text_prompt,
+                debug=debug,
+                event_callback=event_callback
+            )
+            result_container['result'] = result
+            event_queue.put({'type': 'agent_complete', 'data': result})
+        except Exception as e:
+            result_container['error'] = str(e)
+            event_queue.put({'type': 'error', 'data': {'message': str(e)}})
+    
+    # Start agent in background thread
+    thread = threading.Thread(target=run_agent_thread)
+    thread.daemon = True
+    thread.start()
+    
+    def generate():
+        """Generate SSE events"""
+        while True:
+            try:
+                event = event_queue.get(timeout=0.5)
+                yield f"data: {json.dumps(event)}\n\n"
+                
+                if event['type'] in ('agent_complete', 'error'):
+                    break
+            except queue.Empty:
+                # Send keepalive
+                yield f": keepalive\n\n"
+    
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no'
+        }
+    )
 
 
 @app.route('/api/outputs/<path:filename>', methods=['GET'])

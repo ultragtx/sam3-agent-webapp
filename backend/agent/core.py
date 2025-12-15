@@ -50,6 +50,41 @@ class AgentCore:
         else:
             self.iterative_checking_prompt = self._get_default_iterative_prompt()
     
+    def _normalize_result_paths(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize all paths in result to be relative to output_dir
+        
+        Args:
+            result: Result dictionary with paths
+            
+        Returns:
+            Result with normalized paths
+        """
+        normalized = result.copy()
+        
+        # Normalize history paths
+        if 'history' in normalized and normalized['history']:
+            for round_data in normalized['history']:
+                if 'sam3_calls' in round_data:
+                    for call in round_data['sam3_calls']:
+                        if 'json_path' in call:
+                            call['json_path'] = self.sam3_client.normalize_path(call['json_path'])
+                        if 'image_path' in call:
+                            call['image_path'] = self.sam3_client.normalize_path(call['image_path'])
+        
+        # Normalize final output paths
+        if 'final_output' in normalized and normalized['final_output']:
+            if 'json_path' in normalized['final_output']:
+                normalized['final_output']['json_path'] = self.sam3_client.normalize_path(
+                    normalized['final_output']['json_path']
+                )
+            if 'image_path' in normalized['final_output']:
+                normalized['final_output']['image_path'] = self.sam3_client.normalize_path(
+                    normalized['final_output']['image_path']
+                )
+        
+        return normalized
+    
     def _get_default_system_prompt(self) -> str:
         """Get default system prompt if file doesn't exist"""
         return """You are a helpful visual-concept grounding assistant capable of leveraging tool calls to ground concepts the user refers to, and providing structured JSON outputs and tool calls.
@@ -75,7 +110,8 @@ Respond with either:
         image_path: str,
         text_prompt: str,
         debug: bool = True,
-        max_generations: int = 100
+        max_generations: int = 100,
+        event_callback=None
     ) -> Dict[str, Any]:
         """
         Run SAM3 Agent with iterative reasoning
@@ -85,6 +121,7 @@ Respond with either:
             text_prompt: User's segmentation query
             debug: Enable debug mode
             max_generations: Maximum MLLM generation rounds
+            event_callback: Optional callback function for progress events
         
         Returns:
             Dictionary with agent history and final results
@@ -94,6 +131,16 @@ Respond with either:
         print(f"📷 Image: {image_path}")
         print(f"💬 Query: {text_prompt}")
         print(f"{'='*60}\n")
+        
+        # Emit start event
+        if event_callback:
+            event_callback({
+                'type': 'agent_start',
+                'data': {
+                    'image_path': image_path,
+                    'text_prompt': text_prompt
+                }
+            })
         
         # Initialize state
         messages = [
@@ -126,8 +173,51 @@ Respond with either:
         while generation_count < max_generations:
             print(f"\n{'-'*30} Round {generation_count + 1} {'-'*30}\n")
             
-            # Call MLLM
-            generated_text = self.mllm_client.generate(messages)
+            # Emit round start event
+            if event_callback:
+                event_callback({
+                    'type': 'round_start',
+                    'data': {
+                        'round': generation_count + 1
+                    }
+                })
+            
+            # Call MLLM with streaming
+            if event_callback:
+                # Stream the response
+                if event_callback:
+                    event_callback({
+                        'type': 'llm_start',
+                        'data': {
+                            'round': generation_count + 1
+                        }
+                    })
+                
+                generated_text = ""
+                stream = self.mllm_client.generate(messages, stream=True)
+                for chunk in stream:
+                    generated_text += chunk
+                    if event_callback:
+                        event_callback({
+                            'type': 'llm_chunk',
+                            'data': {
+                                'round': generation_count + 1,
+                                'chunk': chunk,
+                                'accumulated': generated_text
+                            }
+                        })
+                
+                if event_callback:
+                    event_callback({
+                        'type': 'llm_complete',
+                        'data': {
+                            'round': generation_count + 1,
+                            'text': generated_text
+                        }
+                    })
+            else:
+                # Non-streaming mode
+                generated_text = self.mllm_client.generate(messages)
             
             if generated_text is None:
                 print("❌ MLLM returned None, stopping agent")
@@ -139,7 +229,9 @@ Respond with either:
             agent_history.append({
                 'round': generation_count + 1,
                 'messages': copy.deepcopy(messages),
-                'generated_text': generated_text
+                'generated_text': generated_text,
+                'sam3_calls': [],
+                'status': 'complete'
             })
             
             # Parse tool call
@@ -159,7 +251,7 @@ Respond with either:
             if tool_name == "segment_phrase":
                 result = self._handle_segment_phrase(
                     tool_call, messages, generated_text, image_path, text_prompt,
-                    used_text_prompts, sam_output_dir
+                    used_text_prompts, sam_output_dir, event_callback
                 )
                 
                 if result is None:
@@ -167,6 +259,16 @@ Respond with either:
                 
                 latest_sam3_text_prompt = result['text_prompt']
                 latest_output_json_path = result['json_path']
+                
+                # Add SAM3 call info to current round's history
+                if agent_history:
+                    agent_history[-1]['sam3_calls'].append({
+                        'text_prompt': result['text_prompt'],
+                        'num_masks': result['num_masks'],
+                        'json_path': result['json_path'],
+                        'image_path': result['image_path'],
+                        'status': 'complete'
+                    })
             
             elif tool_name == "examine_each_mask":
                 result = self._handle_examine_each_mask(
@@ -183,24 +285,39 @@ Respond with either:
                     image_path, text_prompt
                 )
                 
+                # Add the final visualization to current round's SAM3 calls
+                # This shows what the final selection looks like
+                if agent_history and final_result:
+                    agent_history[-1]['sam3_calls'].append({
+                        'text_prompt': f"Final selection: {tool_call['parameters']['final_answer_masks']}",
+                        'num_masks': final_result['num_masks'],
+                        'json_path': final_result['json_path'],
+                        'image_path': final_result['image_path'],
+                        'status': 'complete'
+                    })
+                
                 print(f"\n{'='*60}")
                 print("✅ Agent completed successfully!")
                 print(f"{'='*60}\n")
                 
-                return {
+                result = {
                     'status': 'success',
                     'history': agent_history,
                     'final_output': final_result
                 }
+                
+                return self._normalize_result_paths(result)
             
             elif tool_name == "report_no_mask":
                 print("📝 Agent reports no valid masks found")
                 
-                return {
+                result = {
                     'status': 'no_masks',
                     'history': agent_history,
                     'message': 'No objects match the query'
                 }
+                
+                return self._normalize_result_paths(result)
             
             else:
                 print(f"⚠️  Unknown tool: {tool_name}")
@@ -210,18 +327,30 @@ Respond with either:
         
         print(f"\n⚠️  Agent stopped after {generation_count} rounds")
         
-        return {
+        result = {
             'status': 'incomplete',
             'history': agent_history,
             'message': f'Agent stopped after {generation_count} rounds'
         }
+        
+        return self._normalize_result_paths(result)
     
     def _handle_segment_phrase(
         self, tool_call, messages, generated_text, image_path, text_prompt,
-        used_text_prompts, sam_output_dir
+        used_text_prompts, sam_output_dir, event_callback=None
     ):
         """Handle segment_phrase tool call"""
         text_prompt_param = tool_call['parameters']['text_prompt']
+        
+        # Emit SAM3 start event
+        if event_callback:
+            event_callback({
+                'type': 'sam3_start',
+                'data': {
+                    'text_prompt': text_prompt_param,
+                    'image_path': image_path
+                }
+            })
         
         # Check for duplicate prompts
         if text_prompt_param in used_text_prompts:
@@ -251,6 +380,18 @@ Respond with either:
         )
         
         num_masks = sam3_result['num_masks']
+        
+        # Emit SAM3 complete event
+        if event_callback:
+            event_callback({
+                'type': 'sam3_complete',
+                'data': {
+                    'text_prompt': text_prompt_param,
+                    'num_masks': num_masks,
+                    'json_path': self.sam3_client.normalize_path(sam3_result['json_path']),
+                    'image_path': self.sam3_client.normalize_path(sam3_result['image_path'])
+                }
+            })
         
         # Add assistant message
         messages.append({
@@ -282,6 +423,7 @@ Respond with either:
         return {
             'text_prompt': text_prompt_param,
             'json_path': sam3_result['json_path'],
+            'image_path': sam3_result['image_path'],
             'num_masks': num_masks
         }
     
@@ -388,7 +530,7 @@ Respond with either:
         """Handle select_masks_and_return tool call"""
         mask_indices = tool_call['parameters']['final_answer_masks']
         
-        # Load outputs
+        # Load outputs from JSON
         with open(latest_output_json_path, 'r') as f:
             current_outputs = json.load(f)
         

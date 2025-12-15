@@ -11,14 +11,42 @@ from utils.visualization import visualize_masks
 class SAM3Client:
     """Client for SAM3 segmentation operations"""
     
-    def __init__(self, processor):
+    def __init__(self, processor, output_base_dir: str = "./outputs"):
         """
         Initialize SAM3 Client
         
         Args:
             processor: SAM3 processor/predictor instance
+            output_base_dir: Base output directory for relative path calculation
         """
         self.processor = processor
+        self.output_base_dir = os.path.abspath(output_base_dir)
+    
+    def normalize_path(self, full_path: str) -> str:
+        """
+        Convert absolute path to relative path from output_base_dir
+        
+        Args:
+            full_path: Full absolute or relative path
+            
+        Returns:
+            Path relative to output_base_dir
+        """
+        # If already a relative path without './', return as-is
+        if not os.path.isabs(full_path) and not full_path.startswith('./') and not full_path.startswith('../'):
+            return full_path
+        
+        abs_path = os.path.abspath(full_path)
+        base_path = self.output_base_dir
+        
+        # Get relative path from base
+        if abs_path.startswith(base_path):
+            rel_path = os.path.relpath(abs_path, base_path)
+            # Normalize path separators
+            return rel_path.replace('\\', '/')
+        
+        # If not under base, return as-is
+        return full_path
     
     def _sam3_inference(self, image_path: str, text_prompt: str) -> Dict[str, Any]:
         """

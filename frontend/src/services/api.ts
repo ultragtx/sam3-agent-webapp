@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { MLLMConfig, AgentResult, SAM3Result, HealthStatus } from '../types';
+import type { MLLMConfig, AgentResult, SAM3Result, HealthStatus, StreamEvent } from '../types';
 
 // Use relative path to go through Vite proxy, avoiding CORS issues
 const API_BASE = '';
@@ -44,6 +44,102 @@ export const runAgent = async (
   });
   
   return response.data;
+};
+
+export const runAgentStream = (
+  imagePath: string,
+  textPrompt: string,
+  mllmConfig?: Partial<MLLMConfig>,
+  debug: boolean = true,
+  onEvent?: (event: StreamEvent) => void,
+  onComplete?: (result: AgentResult) => void,
+  onError?: (error: string) => void
+): EventSource => {
+  // Use EventSource for SSE
+  const params = new URLSearchParams({
+    image_path: imagePath,
+    text_prompt: textPrompt,
+    debug: debug.toString(),
+  });
+  
+  if (mllmConfig) {
+    params.append('mllm_config', JSON.stringify(mllmConfig));
+  }
+  
+  // For POST with SSE, we need to use fetch instead of EventSource
+  // Create a custom implementation
+  const controller = new AbortController();
+  
+  fetch('/api/agent/run-stream', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      image_path: imagePath,
+      text_prompt: textPrompt,
+      mllm_config: mllmConfig,
+      debug,
+    }),
+    signal: controller.signal,
+  })
+    .then(async (response) => {
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+      
+      if (!reader) {
+        throw new Error('No response body');
+      }
+      
+      let buffer = '';
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        
+        if (done) break;
+        
+        buffer += decoder.decode(value, { stream: true });
+        
+        // Process complete messages
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            try {
+              const event: StreamEvent = JSON.parse(data);
+              
+              if (onEvent) {
+                onEvent(event);
+              }
+              
+              if (event.type === 'agent_complete' && onComplete) {
+                onComplete(event.data as AgentResult);
+              } else if (event.type === 'error' && onError) {
+                onError(event.data.message);
+              }
+            } catch (e) {
+              console.error('Failed to parse SSE message:', e);
+            }
+          }
+        }
+      }
+    })
+    .catch((error) => {
+      if (error.name !== 'AbortError' && onError) {
+        onError(error.message);
+      }
+    });
+  
+  // Return a mock EventSource-like object with close method
+  return {
+    close: () => controller.abort(),
+  } as EventSource;
 };
 
 export const sam3Segment = async (

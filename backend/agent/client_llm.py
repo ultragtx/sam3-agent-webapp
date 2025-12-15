@@ -92,7 +92,7 @@ class MLLMClient:
         max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         stream: bool = False
-    ) -> Optional[str]:
+    ):
         """
         Generate response from MLLM
         
@@ -103,7 +103,7 @@ class MLLMClient:
             stream: Whether to stream response
         
         Returns:
-            Generated text response
+            Generator yielding chunks if stream=True, or complete text if stream=False
         """
         # Process messages (convert image paths to base64)
         processed_messages = self._process_messages(messages)
@@ -119,14 +119,24 @@ class MLLMClient:
             stream=stream
         )
         
-        # Extract response
-        if response.choices and len(response.choices) > 0:
-            generated_text = response.choices[0].message.content
-            print(f"✅ MLLM response received ({len(generated_text)} chars)")
-            return generated_text
+        if stream:
+            # Return generator for streaming
+            def stream_generator():
+                for chunk in response:
+                    if chunk.choices and len(chunk.choices) > 0:
+                        delta = chunk.choices[0].delta
+                        if hasattr(delta, 'content') and delta.content:
+                            yield delta.content
+            return stream_generator()
         else:
-            print(f"⚠️  Unexpected response format: {response}")
-            return None
+            # Extract complete response
+            if response.choices and len(response.choices) > 0:
+                generated_text = response.choices[0].message.content
+                print(f"✅ MLLM response received ({len(generated_text)} chars)")
+                return generated_text
+            else:
+                print(f"⚠️  Unexpected response format: {response}")
+                return None
     
     def update_config(
         self,
