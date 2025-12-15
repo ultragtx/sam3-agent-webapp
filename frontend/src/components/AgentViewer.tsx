@@ -77,9 +77,10 @@ export default function AgentViewer({ result }: AgentViewerProps) {
       )}
 
       {/* Iteration History */}
-      <div className="space-y-2">
-        <h3 className="text-lg font-semibold mb-3">Iteration History ({result.history.length} rounds)</h3>
-        {result.history.map((round) => (
+      {result.history && result.history.length > 0 && (
+        <div className="space-y-2">
+          <h3 className="text-lg font-semibold mb-3">Iteration History ({result.history.length} rounds)</h3>
+          {result.history.map((round) => (
           <div key={round.round} className="bg-gray-700 rounded-lg overflow-hidden">
             <button
               onClick={() => toggleRound(round.round)}
@@ -145,6 +146,7 @@ export default function AgentViewer({ result }: AgentViewerProps) {
           </div>
         ))}
       </div>
+      )}
     </div>
   );
 }

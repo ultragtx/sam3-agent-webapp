@@ -13,7 +13,7 @@ export interface AgentRound {
 
 export interface AgentResult {
   status: string;
-  history: AgentRound[];
+  history?: AgentRound[];
   final_output?: {
     json_path: string;
     image_path: string;

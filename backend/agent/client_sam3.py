@@ -73,7 +73,7 @@ class SAM3Client:
         
         # Encode masks to RLE
         from utils.rle import rle_encode
-        pred_masks_rle = rle_encode(masks.squeeze(1)) if len(masks) > 0 else []
+        pred_masks_rle = rle_encode(masks.squeeze(1).cpu().numpy()) if len(masks) > 0 else []
         pred_masks_rle = [m['counts'] for m in pred_masks_rle]
         
         outputs = {

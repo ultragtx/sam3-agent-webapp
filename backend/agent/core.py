@@ -386,7 +386,7 @@ Respond with either:
         image_path, text_prompt
     ):
         """Handle select_masks_and_return tool call"""
-        mask_indices = tool_call['parameters']['mask_indices']
+        mask_indices = tool_call['parameters']['final_answer_masks']
         
         # Load outputs
         with open(latest_output_json_path, 'r') as f:
